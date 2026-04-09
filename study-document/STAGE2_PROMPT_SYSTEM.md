@@ -119,18 +119,35 @@ export function provider(model: Provider.Model) {
 | title      | primary (hidden) | title.txt      | 标题生成     |
 | summary    | primary (hidden) | summary.txt    | 摘要生成     |
 
-### 4.2 提示词选择逻辑
+### 4.2 提示词选择逻辑（重要）
 
-文件：session/llm.ts:72
+文件：session/llm.ts:70-79
 
 ```typescript
+// use agent prompt otherwise provider prompt
+// For Codex sessions, skip SystemPrompt.provider() since it's sent via options.instructions
 ...(input.agent.prompt ? [input.agent.prompt] : isCodex ? [] : SystemPrompt.provider(input.model)),
+// any custom prompt passed into this call
+...input.system,
+// any custom prompt from last user message
+...(input.user.system ? [input.user.system] : []),
 ```
 
-优先级：
+**关键结论：Agent 提示词和 Provider 提示词是「替代关系」，不是叠加关系！**
 
-1. agent.prompt 存在 → 使用 agent.prompt
-2. agent.prompt 不存在 → 使用 SystemPrompt.provider()
+| 条件                           | 结果                                   |
+| ------------------------------ | -------------------------------------- |
+| agent.prompt 存在              | 使用 agent.prompt                      |
+| agent.prompt 不存在 + 非 Codex | 使用 provider prompt                   |
+| Codex 模式                     | 跳过（通过 options.instructions 发送） |
+
+**完整优先级顺序：**
+
+1. **agent.prompt** （或 provider prompt 作为后备）
+2. **input.system** （自定义传入）
+3. **user.system** （用户消息携带）
+
+所有内容用 "\n" 连接成单一系统消息。
 
 ### 4.3 各 Agent 提示词内容
 
@@ -417,11 +434,357 @@ messages:
 
 文件：skill/skill.ts, tool/skill.ts
 
-阅读要点：
+---
 
-- [ ] Skill 扫描目录
-- [ ] Skill Tool 实现
-- [ ] 三种注入方式对比
+#### 5.1 Skill 系统概述
+
+Skill 是一个可动态加载的领域知识模块，类似于 Claude Code 的 skill 系统。
+
+##### SKILL.md 格式
+
+```markdown
+---
+name: code-review
+description: Review code for quality and best practices
+---
+
+# Code Review Skill
+
+你是一个代码审查专家...
+```
+
+---
+
+#### 5.2 Skill 扫描目录 (skill/skill.ts)
+
+##### 第 45-50 行：定义扫描目录
+
+```typescript
+// External skill directories to search for (project-level and global)
+// These follow the directory layout used by Claude Code and other agents.
+const EXTERNAL_DIRS = [".claude", ".agents"] // 外部目录名
+const EXTERNAL_SKILL_PATTERN = "skills/**/SKILL.md" // 外部 Skill 模式
+const OPENCODE_SKILL_PATTERN = "{skill,skills}/**/SKILL.md" // OpenCode 模式
+const SKILL_PATTERN = "**/SKILL.md" // 通配模式
+```
+
+| 目录                  | 说明          |
+| --------------------- | ------------- |
+| `.claude/skills/`     | 全局外部      |
+| `.agents/skills/`     | 全局外部      |
+| `.opencode/skill/`    | OpenCode 专用 |
+| `config.skills.paths` | 用户配置路径  |
+| `config.skills.urls`  | 远程 URL      |
+
+##### 第 52-88 行：addSkill 函数
+
+```typescript
+export const state = Instance.state(async () => {
+  const skills: Record<string, Info> = {}
+  const dirs = new Set<string>()
+
+  const addSkill = async (match: string) => {                    // match = 文件路径
+    // 1. 解析 Markdown 文件
+    const md = await ConfigMarkdown.parse(match).catch((err) => { // 解析 frontmatter
+      Bus.publish(Session.Event.Error, {...})                     // 发布错误事件
+      log.error("failed to load skill", { skill: match, err })
+      return undefined
+    })
+
+    if (!md) return                                              // 解析失败则跳过
+
+    // 2. 提取 name 和 description
+    const parsed = Info.pick({ name: true, description: true }).safeParse(md.data)
+    if (!parsed.success) return                                  // 验证失败则跳过
+
+    // 3. 警告重复名称
+    if (skills[parsed.data.name]) {
+      log.warn("duplicate skill name", {...})                   // 记录警告
+    }
+
+    dirs.add(path.dirname(match))                                 // 记录目录
+
+    // 4. 存储 Skill 信息
+    skills[parsed.data.name] = {
+      name: parsed.data.name,
+      description: parsed.data.description,
+      location: match,
+      content: md.content,                                       // Markdown 正文
+    }
+  }
+```
+
+关键点：
+
+- 解析 Markdown frontmatter 获取 name/description
+- 正文作为 content 存储
+- 重复名称会警告但覆盖
+
+##### 第 90-102 行：scanExternal 函数
+
+```typescript
+const scanExternal = async (root: string, scope: "global" | "project") => {
+  return Glob.scan(EXTERNAL_SKILL_PATTERN, {
+    // 扫描 skills/**/SKILL.md
+    cwd: root,
+    absolute: true,
+    include: "file",
+    dot: true,
+    symlink: true,
+  })
+    .then((matches) => Promise.all(matches.map(addSkill))) // 并行添加
+    .catch((error) => {
+      log.error(`failed to scan ${scope} skills`, { dir: root, error })
+    })
+}
+```
+
+##### 第 106-120 行：扫描外部目录
+
+```typescript
+if (!Flag.OPENCODE_DISABLE_EXTERNAL_SKILLS) {
+  // 检查是否禁用
+  // 1. 扫描全局目录 (~/.claude/skills/, ~/.agents/skills/)
+  for (const dir of EXTERNAL_DIRS) {
+    const root = path.join(Global.Path.home, dir)
+    if (!(await Filesystem.isDir(root))) continue // 跳过不存在的目录
+    await scanExternal(root, "global")
+  }
+
+  // 2. 扫描项目目录 (向上搜索 .claude/, .agents/)
+  for await (const root of Filesystem.up({
+    targets: EXTERNAL_DIRS,
+    start: Instance.directory,
+    stop: Instance.worktree,
+  })) {
+    await scanExternal(root, "project")
+  }
+}
+```
+
+扫描顺序：全局 → 项目（项目级覆盖全局）
+
+##### 第 122-133 行：扫描 OpenCode 目录
+
+```typescript
+// Scan .opencode/skill/ directories
+for (const dir of await Config.directories()) {
+  const matches = await Glob.scan(OPENCODE_SKILL_PATTERN, {
+    cwd: dir,
+    absolute: true,
+    include: "file",
+    symlink: true,
+  })
+  for (const match of matches) {
+    await addSkill(match)
+  }
+}
+```
+
+##### 第 135-153 行：扫描配置路径
+
+```typescript
+// Scan additional skill paths from config
+const config = await Config.get()
+for (const skillPath of config.skills?.paths ?? []) {
+  const expanded = skillPath.startsWith("~/") ? path.join(os.homedir(), skillPath.slice(2)) : skillPath
+  const resolved = path.isAbsolute(expanded) ? expanded : path.join(Instance.directory, expanded)
+  // ...扫描文件
+}
+```
+
+##### 第 155-170 行：远程 URL
+
+```typescript
+// Download and load skills from URLs
+for (const url of config.skills?.urls ?? []) {
+  const list = await Discovery.pull(url) // 下载列表
+  for (const dir of list) {
+    // 扫描 SKILL.md
+  }
+}
+```
+
+---
+
+#### 5.3 Skill Tool 实现 (tool/skill.ts)
+
+##### 第 10-46 行：Tool 定义
+
+```typescript
+export const SkillTool = Tool.define("skill", async (ctx) => {
+  const skills = await Skill.all()
+
+  // 1. 按权限过滤
+  const agent = ctx?.agent
+  const accessibleSkills = agent
+    ? skills.filter((skill) => {
+        const rule = PermissionNext.evaluate("skill", skill.name, agent.permission)
+        return rule.action !== "deny"                           // deny 权限的 Skill 不显示
+      })
+    : skills
+
+  // 2. 构建工具描述（包含 available_skills 列表）
+  const description = [
+    "Load a specialized skill...",
+    "",
+    "<available_skills>",
+    ...accessibleSkills.flatMap((skill) => [
+      `  <skill>`,
+      `    <name>${skill.name}</name>`,
+      `    <description>${skill.description}</description>`,
+      `    <location>${pathToFileURL(skill.location).href}</location>`,
+      `  </skill>`,
+    ]),
+    "</available_skills>",
+  ].join("\n")
+```
+
+关键点：
+
+- 根据 agent 权限过滤可用 Skill
+- 在工具描述中列出 `<available_skills>`
+
+##### 第 54-56 行：参数定义
+
+```typescript
+const parameters = z.object({
+  name: z.string().describe(`The name of skill from available_skills...`),
+})
+```
+
+##### 第 61-75 行：执行逻辑
+
+```typescript
+async execute(params, ctx) {
+  const skill = await Skill.get(params.name)
+
+  if (!skill) {
+    throw new Error(`Skill "${params.name}" not found...`)
+  }
+
+  // 1. 权限检查
+  await ctx.ask({
+    permission: "skill",
+    patterns: [params.name],
+    always: [params.name],
+    metadata: {},
+  })
+
+  // 2. 获取 Skill 目录和文件列表
+  const dir = path.dirname(skill.location)
+  const files = await iife(async () => {
+    // 使用 Ripgrep 扫描目录中的文件（最多 10 个）
+    const arr = []
+    for await (const file of Ripgrep.files({ cwd: dir, ... })) {
+      if (file.includes("SKILL.md")) continue                     // 跳过自身
+      arr.push(path.resolve(dir, file))
+      if (arr.length >= limit) break
+    }
+    return arr
+  })
+
+  // 3. 返回 Skill 内容
+  return {
+    title: `Loaded skill: ${skill.name}`,
+    output: [
+      `<skill_content name="${skill.name}">`,
+      `# Skill: ${skill.name}`,
+      "",                                                    // 空行
+      skill.content.trim(),                                  // SKILL.md 正文
+      "",
+      `Base directory for this skill: ${base}`,
+      "<skill_files>",
+      files,                                                 // 文件列表
+      "</skill_files>",
+      "</skill_content>",
+    ].join("\n"),
+  }
+}
+```
+
+---
+
+#### 5.4 三种注入方式对比
+
+| 方式           | 触发者       | 注入位置               | 时机         |
+| -------------- | ------------ | ---------------------- | ------------ |
+| **Skill Tool** | 模型主动调用 | 工具返回值 (tool role) | 运行时       |
+| **Command**    | 用户斜杠命令 | 用户消息 (user role)   | 会话开始     |
+| **Permission** | 系统自动     | 权限规则               | Agent 初始化 |
+
+##### Skill Tool 注入流程
+
+```
+1. 构建工具时
+   ToolRegistry.tools() → SkillTool → description 包含 <available_skills>
+
+2. 模型收到请求
+   看到可用 Skill 列表
+
+3. 模型决定调用
+   模型选择调用 skill 工具，传入 skill name
+
+4. 工具执行
+   SkillTool.execute() → 返回 <skill_content> 块
+
+5. 注入到对话
+   工具结果作为 tool role 消息，包含 <skill_content>
+
+6. 模型继续推理
+   基于 Skill 内容生成响应
+```
+
+##### 注入内容格式
+
+```xml
+<skill_content name="code-review">
+# Skill: code-review
+
+你是一个代码审查专家...
+
+<skill_files>
+/path/to/skill/script.sh
+/path/to/skill/reference.md
+</skill_files>
+</skill_content>
+```
+
+---
+
+#### 5.5 Skill 权限控制
+
+文件：tool/skill.ts:14-20
+
+```typescript
+const accessibleSkills = agent
+  ? skills.filter((skill) => {
+      const rule = PermissionNext.evaluate("skill", skill.name, agent.permission)
+      return rule.action !== "deny" // 只显示非 deny 的
+    })
+  : skills
+```
+
+默认权限（agent/agent.ts）：
+
+```typescript
+{
+  "*": "deny",                                               // 默认禁止
+  skill: "allow",                                             // 允许使用 skill
+}
+```
+
+---
+
+#### 5.6 总结
+
+| 要点       | 说明                                                      |
+| ---------- | --------------------------------------------------------- |
+| Skill 定义 | SKILL.md 文件，frontmatter 包含 name/description          |
+| 扫描来源   | 5 种目录：.claude, .agents, .opencode, config.paths, URLs |
+| 加载时机   | 启动时加载到 state，后续直接使用                          |
+| 注入方式   | 模型主动调用 Tool → 返回 <skill_content>                  |
+| 权限控制   | 根据 agent.permission 过滤可用 Skill                      |
 
 ---
 
