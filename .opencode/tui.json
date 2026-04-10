@@ -13,6 +13,7 @@
           "dialog_close": "escape,q"
         }
       }
-    ]
+    ],
+    ["./plugins/skill-tracker", { "port": 3210 }]
   ]
 }
