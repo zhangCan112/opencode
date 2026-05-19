@@ -28,5 +28,7 @@ target
 opencode-dev
 UPCOMING_CHANGELOG.md
 logs/
+skill-tracker-log/
+nul
 *.bun-build
 tsconfig.tsbuildinfo
