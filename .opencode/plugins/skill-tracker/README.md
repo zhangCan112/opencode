@@ -5,7 +5,7 @@ An OpenCode plugin that monitors, logs, and visualizes every invocation of the `
 ## What It Does
 
 - **Tracks** every skill invocation across all sessions and subagents
-- **Persists** records as JSONL files so history survives restarts
+- **Persists** records via SQLite (`bun:sqlite`) so history survives restarts
 - **Serves** a real-time web dashboard with REST API and SSE streaming
 - **Shows** a live sidebar in the terminal UI with clickable links to the dashboard
 
@@ -65,6 +65,7 @@ Once OpenCode is running, open `http://localhost:3210` in your browser.
 | `GET /api/records`             | JSON array of all records (`?session=<id>` to filter) |
 | `GET /api/sessions`            | JSON summary of all sessions with skill counts        |
 | `GET /events`                  | SSE stream — pushes new records in real time          |
+| `GET /admin`                   | Data management: stats, export, clear by all/session |
 
 The dashboard auto-refreshes every 2 seconds and supports SSE for instant live updates.
 
@@ -75,6 +76,7 @@ The dashboard auto-refreshes every 2 seconds and supports SSE for instant live u
 - Agent badges: **pri** (primary, green) and **sub** (subagent, yellow)
 - Stats bar showing total invocations and session count
 - Per-session filtering and skill highlighting via URL
+- **Admin page** (`/admin`) with data management: view stats, export JSON, clear all or by session
 
 ## Terminal Sidebar
 
@@ -105,15 +107,17 @@ Each tracked invocation is stored as a JSON record:
 }
 ```
 
-Log files are stored at `<project-root>/skill-tracker-log/<sessionID>/skill-tracker.jsonl`.
+Data is stored in a SQLite database at `<project-root>/skill-tracker-log/skill-tracker.db`.
+
+> **Migration:** On first run after update, existing JSONL files are automatically imported into SQLite and renamed to `.jsonl.imported`.
 
 ## How It Works
 
 1. The **server plugin** hooks into `chat.message` to capture session context and `tool.execute.after` to intercept every `skill` tool call
-2. Each invocation is recorded to an in-memory array and appended to a JSONL log file
+2. Each invocation is written to a SQLite database via `bun:sqlite` (WAL mode for concurrency)
 3. The record is broadcast to all connected SSE clients
 4. The **TUI plugin** scans session messages to display skills in the sidebar and links to the web dashboard
-5. On restart, historical JSONL logs are loaded back into memory
+5. On restart, the SQLite database is queried directly — no JSONL loading needed
 
 ## Requirements
 
