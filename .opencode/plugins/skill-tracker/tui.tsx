@@ -5,10 +5,12 @@ const id = "skill-tracker"
 
 function launch(url: string) {
   try {
-    const cmd = process.platform === "win32" ? "cmd" : "open"
+    const cmd = process.platform === "win32" ? "cmd" : "xdg-open"
     const args = process.platform === "win32" ? ["/c", "start", "", url] : [url]
     Bun.spawn(cmd, args)
-  } catch {}
+  } catch (e) {
+    console.warn("[skill-tracker] failed to open browser:", e)
+  }
 }
 
 type SkillEntry = { name: string; count: number; trigger: string }
